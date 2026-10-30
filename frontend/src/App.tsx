@@ -29,6 +29,7 @@ import {
   evaluateWhatIf,
   fetchPlans,
   fetchSystemStatus,
+  optimizeTimeline,
   restoreSnapshot,
   scoutVendors,
   sendCoordinatorChat,
@@ -66,7 +67,9 @@ export function App() {
   const [whatIfGuests, setWhatIfGuests] = useState<number>(100);
   const [whatIfBudget, setWhatIfBudget] = useState<number>(2200000);
   const [whatIfDate, setWhatIfDate] = useState<string>('2027-02-14');
+  const [whatIfPriorities, setWhatIfPriorities] = useState<string[]>([]);
   const [simulating, setSimulating] = useState<boolean>(false);
+  const [optimizingTimeline, setOptimizingTimeline] = useState<boolean>(false);
   const [whatIfResult, setWhatIfResult] = useState<WhatIfEvaluationResponse | null>(null);
   const [previewedTradeoff, setPreviewedTradeoff] = useState<TradeoffOption | null>(null);
   const [scoutingCategoryId, setScoutingCategoryId] = useState<string | null>(null);
@@ -80,6 +83,7 @@ export function App() {
     setWhatIfGuests(plan.constraint_profile.guest_count);
     setWhatIfBudget(plan.constraint_profile.total_budget_limit);
     setWhatIfDate(plan.constraint_profile.event_date);
+    setWhatIfPriorities(plan.constraint_profile.priority_ranking);
     setWhatIfResult(null);
     setPreviewedTradeoff(null);
   };
@@ -132,7 +136,7 @@ export function App() {
         guest_count: whatIfGuests,
         total_budget_limit: whatIfBudget,
         event_date: whatIfDate,
-        priority_ranking: activePlan.constraint_profile.priority_ranking,
+        priority_ranking: whatIfPriorities.length > 0 ? whatIfPriorities : activePlan.constraint_profile.priority_ranking,
       });
       setWhatIfResult(res);
       setPreviewedTradeoff(null);
@@ -149,12 +153,27 @@ export function App() {
         guest_count: whatIfGuests,
         total_budget_limit: whatIfBudget,
         event_date: whatIfDate,
-        priority_ranking: activePlan.constraint_profile.priority_ranking,
+        priority_ranking: whatIfPriorities.length > 0 ? whatIfPriorities : activePlan.constraint_profile.priority_ranking,
       },
       option
     );
     replacePlanInState(updated);
     syncWhatIfControls(updated);
+  };
+
+  const handlePromotePriority = (item: string) => {
+    setWhatIfPriorities((prev) => [item, ...prev.filter((p) => p !== item)]);
+  };
+
+  const handleOptimizeTimeline = async () => {
+    if (!activePlan) return;
+    setOptimizingTimeline(true);
+    try {
+      const updated = await optimizeTimeline(activePlan.id);
+      replacePlanInState(updated);
+    } finally {
+      setOptimizingTimeline(false);
+    }
   };
 
   const handleVendorStatusChange = async (vendorId: string, status: SelectionStatus) => {
@@ -517,6 +536,28 @@ export function App() {
               )}
             </div>
           </div>
+
+          <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center gap-2">
+            <span className="text-[11px] font-bold text-slate-500 uppercase tracking-wider">
+              Priority Protection Order (Click to Promote #1):
+            </span>
+            {(whatIfPriorities.length > 0 ? whatIfPriorities : activePlan.constraint_profile.priority_ranking).map(
+              (prio, idx) => (
+                <button
+                  key={prio}
+                  type="button"
+                  onClick={() => handlePromotePriority(prio)}
+                  className={`text-[11px] px-2.5 py-1 rounded-full border transition font-medium ${
+                    idx < 2
+                      ? 'bg-amber-100/90 border-amber-300 text-amber-950 font-semibold'
+                      : 'bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  #{idx + 1} {prio}
+                </button>
+              )
+            )}
+          </div>
         </section>
 
         {/* Accessible Live Region for Constraint Violations & Tradeoff Approval Deck */}
@@ -867,14 +908,33 @@ export function App() {
                                 Unlock Vendor
                               </button>
                             ) : (
-                              <button
-                                type="button"
-                                onClick={() => handleVendorStatusChange(v.id, 'LOCKED')}
-                                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white"
-                              >
-                                <Lock className="w-3.5 h-3.5" />
-                                Lock Vendor Quote
-                              </button>
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => handleVendorStatusChange(v.id, 'LOCKED')}
+                                  className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white"
+                                >
+                                  <Lock className="w-3.5 h-3.5" />
+                                  Lock Vendor Quote
+                                </button>
+                                {v.selection_status !== 'REJECTED' ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleVendorStatusChange(v.id, 'REJECTED')}
+                                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-white border border-slate-300 text-slate-600 hover:bg-red-50 hover:text-red-700 hover:border-red-200"
+                                  >
+                                    Reject
+                                  </button>
+                                ) : (
+                                  <button
+                                    type="button"
+                                    onClick={() => handleVendorStatusChange(v.id, 'SHORTLISTED')}
+                                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-white border border-slate-300 text-slate-700 hover:bg-slate-100"
+                                  >
+                                    Restore to Shortlist
+                                  </button>
+                                )}
+                              </>
                             )}
                           </div>
                         </div>
@@ -952,7 +1012,7 @@ export function App() {
 
             {/* Day-Of Sunset-Aligned Run-of-Show */}
             <div className="bg-white rounded-2xl border border-slate-200 p-5 space-y-4">
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <div>
                   <h3 className="text-base font-bold text-slate-900">
                     Day-Of Run-of-Show (Aligned to {activePlan.weather_context.sunset_time_local} Sunset)
@@ -961,7 +1021,15 @@ export function App() {
                     Synchronizes outdoor ceremonies, golden-hour portraits, and weather contingencies.
                   </p>
                 </div>
-                <Sunset className="w-5 h-5 text-amber-600" />
+                <button
+                  type="button"
+                  onClick={handleOptimizeTimeline}
+                  disabled={optimizingTimeline}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-amber-100 hover:bg-amber-200 text-amber-950 text-xs font-semibold transition disabled:opacity-50"
+                >
+                  <Sunset className="w-3.5 h-3.5 text-amber-700" />
+                  {optimizingTimeline ? 'Optimizing...' : 'Optimize Schedule for Sunset'}
+                </button>
               </div>
 
               <div className="space-y-3">

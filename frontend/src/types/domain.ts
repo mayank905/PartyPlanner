@@ -112,6 +112,7 @@ export interface CategoryMutation {
   new_base_cost: number;
   previous_per_head_cost: number;
   new_per_head_cost: number;
+  new_tier_cost?: number | null;
   change_rationale: string;
 }
 

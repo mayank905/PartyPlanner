@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
@@ -144,6 +144,7 @@ class CategoryMutationSchema(BaseModel):
     new_base_cost: float
     previous_per_head_cost: float
     new_per_head_cost: float
+    new_tier_cost: Optional[float] = None
     change_rationale: str
 
 
@@ -174,7 +175,7 @@ class PlanSnapshotSchema(BaseModel):
 
 class CoordinatorChatTurnSchema(BaseModel):
     id: str
-    role: str  # "user" | "assistant"
+    role: Literal["user", "assistant"]
     content: str
     created_at: str
     active_model: str = "resilient_coordinator"
@@ -187,7 +188,7 @@ class EventPlanResponseSchema(BaseModel):
     created_at: str
     updated_at: str
     active_model: str
-    coordinator_mode: str  # "live_gemini" | "resilient_coordinator"
+    coordinator_mode: Literal["live_gemini", "resilient_coordinator"]
     constraint_profile: ConstraintProfileSchema
     weather_context: WeatherContextSchema
     categories: List[BudgetCategorySchema]

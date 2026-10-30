@@ -6,6 +6,7 @@ import uuid
 from datetime import date, timedelta
 from typing import Any, Callable, List, Optional, Tuple, Type, TypeVar
 from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.domain.schemas import (
     BudgetCategorySchema,
@@ -46,8 +47,15 @@ CURRENCY_SYMBOLS = {
 T = TypeVar("T", bound=BaseModel)
 
 
+class CoordinatorSettings(BaseSettings):
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    gemini_api_key: str = ""
+    gemini_model_cascade: str = ""
+
+
 def get_model_cascade() -> List[str]:
-    env_val = os.environ.get("GEMINI_MODEL_CASCADE", "").strip()
+    settings = CoordinatorSettings()
+    env_val = (os.environ.get("GEMINI_MODEL_CASCADE") or settings.gemini_model_cascade).strip()
     if env_val:
         models = [m.strip() for m in env_val.split(",") if m.strip()]
         if models:
@@ -58,7 +66,8 @@ def get_model_cascade() -> List[str]:
 def resolve_api_key(header_key: Optional[str] = None) -> Optional[str]:
     if header_key and header_key.strip():
         return header_key.strip()
-    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    settings = CoordinatorSettings()
+    env_key = (os.environ.get("GEMINI_API_KEY") or settings.gemini_api_key).strip()
     return env_key if env_key else None
 
 
@@ -490,6 +499,7 @@ def _build_heuristic_tradeoffs(
             ratio = target_cat_est / max(1.0, c.estimated_amount)
             new_base = round(c.base_cost * ratio, 0)
             new_per_head = round(c.per_head_cost * ratio, 0)
+            new_tier_cost = round(c.tier_cost * ratio, 0) if c.tier_cost else None
             new_alloc = target_cat_est
             mutations_a.append(
                 CategoryMutationSchema(
@@ -501,6 +511,7 @@ def _build_heuristic_tradeoffs(
                     new_base_cost=new_base,
                     previous_per_head_cost=c.per_head_cost,
                     new_per_head_cost=new_per_head,
+                    new_tier_cost=new_tier_cost,
                     change_rationale=f"Trim non-priority scope by {(1 - ratio) * 100:.0f}% to absorb {guests}-guest scaling.",
                 )
             )
@@ -567,6 +578,7 @@ def _build_heuristic_tradeoffs(
         else:
             new_est = round(c.estimated_amount * 0.92, 0)
             new_base = round(c.base_cost * 0.92, 0)
+            new_tier_cost = round(c.tier_cost * 0.92, 0) if c.tier_cost else None
             mutations_b.append(
                 CategoryMutationSchema(
                     category_id=c.id,
@@ -577,6 +589,7 @@ def _build_heuristic_tradeoffs(
                     new_base_cost=new_base,
                     previous_per_head_cost=c.per_head_cost,
                     new_per_head_cost=c.per_head_cost,
+                    new_tier_cost=new_tier_cost,
                     change_rationale="Negotiate 8% off-peak / bundled vendor discount.",
                 )
             )
@@ -759,12 +772,87 @@ def scout_vendors_for_category(
     return fallback_vendors, model_name, mode
 
 
+class LLMRunOfShowDeck(BaseModel):
+    run_of_show: List[RunOfShowItemSchema]
+
+
+def realign_run_of_show_to_sunset(
+    run_of_show: List[RunOfShowItemSchema],
+    weather: WeatherContextSchema,
+    location_city: str,
+) -> List[RunOfShowItemSchema]:
+    """
+    Realign outdoor and golden-hour RunOfShowItems whenever event_date or WeatherContext.sunset_time_local changes.
+    """
+    sunset_str = weather.sunset_time_local or "18:10"
+    try:
+        sh, sm = [int(x) for x in sunset_str.split(":")]
+    except Exception:
+        sh, sm = 18, 10
+    golden_hour_start = f"{max(0, sh - 1):02d}:{sm:02d}"
+    post_sunset_start = f"{min(23, sh):02d}:{sm:02d}"
+
+    realigned: List[RunOfShowItemSchema] = []
+    for idx, item in enumerate(run_of_show):
+        if idx == 1 or "golden" in item.title.lower() or "sunset" in item.title.lower():
+            realigned.append(
+                item.model_copy(
+                    update={
+                        "start_time": golden_hour_start,
+                        "notes": (
+                            f"Anchored 60 mins before {sunset_str} local sunset in {location_city}. "
+                            + (
+                                "Keep waterproof shamiana/verandah backup ready."
+                                if weather.outdoor_risk_level != OutdoorRiskLevel.LOW
+                                else "Optimal natural light window."
+                            )
+                        ),
+                    }
+                )
+            )
+        elif idx == 2:
+            realigned.append(item.model_copy(update={"start_time": post_sunset_start}))
+        else:
+            realigned.append(item)
+    return realigned
+
+
+def optimize_timeline_schedule(
+    profile: ConstraintProfileSchema,
+    weather: WeatherContextSchema,
+    milestones: List[MilestoneTaskSchema],
+    run_of_show: List[RunOfShowItemSchema],
+    api_key: Optional[str] = None,
+) -> Tuple[List[MilestoneTaskSchema], List[RunOfShowItemSchema], str, str]:
+    """
+    Recalculate MilestoneTask countdowns and optimize RunOfShowItem schedule around local sunset and weather risk via ModelCascade.
+    """
+    updated_milestones = recalculate_milestones_for_date(milestones, profile.event_date)
+    prompt = (
+        f"Optimize the 4-block day-of Run-of-Show schedule for a {profile.guest_count}-guest {profile.event_vertical.value} "
+        f"in {profile.location_city} on {profile.event_date}. Local sunset is at {weather.sunset_time_local} and outdoor "
+        f"weather risk is {weather.outdoor_risk_level.value} ({weather.precipitation_prob_pct:.0f}% rain probability)."
+    )
+    parsed, model_name, mode = invoke_gemini_cascade(
+        prompt=prompt,
+        response_schema=LLMRunOfShowDeck,
+        api_key=api_key,
+    )
+    if parsed is not None and len(parsed.run_of_show) >= 3:
+        return updated_milestones, parsed.run_of_show, model_name, mode
+
+    realigned_ros = realign_run_of_show_to_sunset(run_of_show, weather, profile.location_city)
+    return updated_milestones, realigned_ros, model_name, mode
+
+
 def chat_with_coordinator(
     message: str,
     profile: ConstraintProfileSchema,
     categories: List[BudgetCategorySchema],
     violations: List[ConstraintViolationSchema],
     weather: WeatherContextSchema,
+    vendors: Optional[List[VendorCandidateSchema]] = None,
+    run_of_show: Optional[List[RunOfShowItemSchema]] = None,
     api_key: Optional[str] = None,
 ) -> Tuple[str, Optional[TradeoffOptionSchema], str, str]:
     """
@@ -773,12 +861,30 @@ def chat_with_coordinator(
     """
     symbol = CURRENCY_SYMBOLS.get(profile.currency_code, "₹")
     total_est = sum(c.estimated_amount for c in categories)
+    cat_summary = "; ".join(
+        f"{c.name}: alloc={symbol}{c.allocated_amount:,.0f}, est={symbol}{c.estimated_amount:,.0f} ({c.pricing_model.value})"
+        for c in categories
+    )
+    vendor_summary = "; ".join(
+        f"{v.name} [{v.category_name}, {v.selection_status.value}, max_cap={v.max_capacity}]"
+        for v in (vendors or [])
+    )
+    ros_summary = "; ".join(
+        f"{r.start_time} {r.title} ({'Outdoor' if r.is_outdoor else 'Indoor'})"
+        for r in (run_of_show or [])
+    )
+    viol_summary = "; ".join(f"{v.violation_type.value}: {v.title}" for v in violations) or "None"
+
     prompt = (
         f"You are the AI Celebration Coordinator for an event in {profile.location_city} on {profile.event_date}.\n"
         f"Current Plan Context: {profile.guest_count} guests, Budget Limit {symbol}{profile.total_budget_limit:,.0f}, "
-        f"Current Estimated Spend {symbol}{total_est:,.0f}, Sunset {weather.sunset_time_local}, "
-        f"Outdoor Risk {weather.outdoor_risk_level.value}.\n"
-        f"Active Violations: {len(violations)}\n"
+        f"Current Estimated Spend {symbol}{total_est:,.0f}, Priorities: {', '.join(profile.priority_ranking)}.\n"
+        f"WeatherContext: Sunset {weather.sunset_time_local}, Outdoor Risk {weather.outdoor_risk_level.value} "
+        f"({weather.precipitation_prob_pct:.0f}% rain prob).\n"
+        f"BudgetCategories: {cat_summary}\n"
+        f"VendorCandidates: {vendor_summary}\n"
+        f"RunOfShowItems: {ros_summary}\n"
+        f"Active Violations ({len(violations)}): {viol_summary}\n"
         f"Host Question: {message}\n\n"
         f"Provide concise, practical coordinator guidance with exact numbers in {symbol}, and include a suggested_tradeoff "
         f"if the user is asking about a what-if scenario, budget cut, or guest change."

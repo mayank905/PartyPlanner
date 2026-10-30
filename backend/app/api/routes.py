@@ -31,7 +31,9 @@ from app.services.agent_coordinator import (
     chat_with_coordinator,
     generate_initial_plan,
     get_model_cascade,
+    optimize_timeline_schedule,
     propose_tradeoffs,
+    realign_run_of_show_to_sunset,
     resolve_api_key,
     scout_vendors_for_category,
 )
@@ -46,10 +48,7 @@ from app.services.weather_service import fetch_weather_context
 router = APIRouter(prefix="/api/v1")
 
 
-def _hydrate_plan_response(
-    record: EventPlanRecord,
-    session: Session,
-) -> EventPlanResponseSchema:
+def _deserialize_plan_state(record: EventPlanRecord):
     profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
     weather = WeatherContextSchema.model_validate_json(record.weather_context_json)
     categories = [BudgetCategorySchema.model_validate(c) for c in json.loads(record.categories_json)]
@@ -57,6 +56,14 @@ def _hydrate_plan_response(
     milestones = [MilestoneTaskSchema.model_validate(m) for m in json.loads(record.milestones_json)]
     run_of_show = [RunOfShowItemSchema.model_validate(r) for r in json.loads(record.run_of_show_json)]
     chat_history = [CoordinatorChatTurnSchema.model_validate(t) for t in json.loads(record.chat_history_json)]
+    return profile, weather, categories, vendors, milestones, run_of_show, chat_history
+
+
+def _hydrate_plan_response(
+    record: EventPlanRecord,
+    session: Session,
+) -> EventPlanResponseSchema:
+    profile, weather, categories, vendors, milestones, run_of_show, chat_history = _deserialize_plan_state(record)
 
     updated_categories, violations = evaluate_plan_constraints(
         profile=profile,
@@ -279,7 +286,7 @@ def apply_tradeoff(
     )
 
     # 2. Apply constraint updates + TradeoffOption category mutations
-    profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
+    profile, _, categories, _, milestones, run_of_show, _ = _deserialize_plan_state(record)
     final_guest_count = payload.tradeoff_option.suggested_guest_count or payload.what_if_constraints.guest_count
     final_budget_limit = payload.tradeoff_option.suggested_budget_limit or payload.what_if_constraints.total_budget_limit
     final_event_date = payload.tradeoff_option.suggested_event_date or payload.what_if_constraints.event_date
@@ -293,21 +300,21 @@ def apply_tradeoff(
         }
     )
 
-    categories = [BudgetCategorySchema.model_validate(c) for c in json.loads(record.categories_json)]
     mutation_map = {m.category_id: m for m in payload.tradeoff_option.mutations}
 
     mutated_categories: List[BudgetCategorySchema] = []
     for cat in categories:
         mut = mutation_map.get(cat.id)
         if mut is not None:
-            new_cat = cat.model_copy(
-                update={
-                    "allocated_amount": mut.new_allocated,
-                    "base_cost": mut.new_base_cost,
-                    "per_head_cost": mut.new_per_head_cost,
-                    "notes": f"{cat.notes} | {mut.change_rationale}".strip(" |"),
-                }
-            )
+            cat_updates = {
+                "allocated_amount": mut.new_allocated,
+                "base_cost": mut.new_base_cost,
+                "per_head_cost": mut.new_per_head_cost,
+                "notes": f"{cat.notes} | {mut.change_rationale}".strip(" |"),
+            }
+            if mut.new_tier_cost is not None:
+                cat_updates["tier_cost"] = mut.new_tier_cost
+            new_cat = cat.model_copy(update=cat_updates)
             new_cat.estimated_amount = calculate_category_estimate(new_cat, final_guest_count)
             mutated_categories.append(new_cat)
         else:
@@ -318,14 +325,15 @@ def apply_tradeoff(
             )
             mutated_categories.append(new_cat)
 
-    milestones = [MilestoneTaskSchema.model_validate(m) for m in json.loads(record.milestones_json)]
     updated_milestones = recalculate_milestones_for_date(milestones, final_event_date)
     weather = fetch_weather_context(updated_profile.location_city, final_event_date)
+    updated_run_of_show = realign_run_of_show_to_sunset(run_of_show, weather, updated_profile.location_city)
 
     record.constraint_profile_json = updated_profile.model_dump_json()
     record.weather_context_json = weather.model_dump_json()
     record.categories_json = json.dumps([c.model_dump() for c in mutated_categories])
     record.milestones_json = json.dumps([m.model_dump() for m in updated_milestones])
+    record.run_of_show_json = json.dumps([r.model_dump() for r in updated_run_of_show])
     record.updated_at = utc_now_iso()
 
     session.add(record)
@@ -482,6 +490,37 @@ def toggle_milestone(
     return _hydrate_plan_response(record, session)
 
 
+@router.post("/plans/{plan_id}/timeline/optimize", response_model=EventPlanResponseSchema)
+def optimize_plan_timeline(
+    plan_id: str,
+    session: Session = Depends(get_session),
+    x_gemini_api_key: Optional[str] = Header(default=None),
+):
+    record = session.get(EventPlanRecord, plan_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="EventPlan not found")
+
+    profile, weather, _, _, milestones, run_of_show, _ = _deserialize_plan_state(record)
+    updated_milestones, updated_ros, active_model, mode = optimize_timeline_schedule(
+        profile=profile,
+        weather=weather,
+        milestones=milestones,
+        run_of_show=run_of_show,
+        api_key=x_gemini_api_key,
+    )
+
+    record.milestones_json = json.dumps([m.model_dump() for m in updated_milestones])
+    record.run_of_show_json = json.dumps([r.model_dump() for r in updated_ros])
+    record.active_model = active_model
+    record.coordinator_mode = mode
+    record.updated_at = utc_now_iso()
+
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+    return _hydrate_plan_response(record, session)
+
+
 @router.post("/plans/{plan_id}/chat", response_model=EventPlanResponseSchema)
 def chat_with_plan_coordinator(
     plan_id: str,
@@ -493,11 +532,7 @@ def chat_with_plan_coordinator(
     if not record:
         raise HTTPException(status_code=404, detail="EventPlan not found")
 
-    profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
-    weather = WeatherContextSchema.model_validate_json(record.weather_context_json)
-    categories = [BudgetCategorySchema.model_validate(c) for c in json.loads(record.categories_json)]
-    vendors = [VendorCandidateSchema.model_validate(v) for v in json.loads(record.vendors_json)]
-    chat_history = [CoordinatorChatTurnSchema.model_validate(t) for t in json.loads(record.chat_history_json)]
+    profile, weather, categories, vendors, _, run_of_show, chat_history = _deserialize_plan_state(record)
 
     updated_categories, violations = evaluate_plan_constraints(profile, categories, vendors, weather)
 
@@ -516,6 +551,8 @@ def chat_with_plan_coordinator(
         categories=updated_categories,
         violations=violations,
         weather=weather,
+        vendors=vendors,
+        run_of_show=run_of_show,
         api_key=x_gemini_api_key,
     )
 

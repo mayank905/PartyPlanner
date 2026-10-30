@@ -125,6 +125,15 @@ export async function toggleMilestone(planId: string, milestoneId: string): Prom
   return res.json();
 }
 
+export async function optimizeTimeline(planId: string): Promise<EventPlan> {
+  const res = await fetch(`${API_BASE}/plans/${planId}/timeline/optimize`, {
+    method: 'POST',
+    headers: buildHeaders(),
+  });
+  if (!res.ok) throw new Error('Failed to optimize timeline');
+  return res.json();
+}
+
 export async function sendCoordinatorChat(planId: string, message: string): Promise<EventPlan> {
   const res = await fetch(`${API_BASE}/plans/${planId}/chat`, {
     method: 'POST',

@@ -110,8 +110,10 @@ def evaluate_plan_constraints(
         locked_vendor = locked_by_category.get(cat.id)
         cat_est = calculate_category_estimate(cat, profile.guest_count)
         if locked_vendor is not None:
-            vendor_est = calculate_vendor_estimate(locked_vendor, profile.guest_count)
-            est = max(cat_est, vendor_est)
+            if locked_vendor.pricing_model == PricingModel.TIERED_CAPACITY and locked_vendor.per_head_cost == 0:
+                est = cat_est
+            else:
+                est = calculate_vendor_estimate(locked_vendor, profile.guest_count)
             committed = est
         else:
             est = cat_est
