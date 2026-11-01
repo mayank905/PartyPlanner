@@ -20,6 +20,11 @@ frontend/dist/
 frontend/.vite/
 *.tsbuildinfo
 
+# Internal planning, scratch tickets, and challenge prompt docs (excluded from GitHub)
+.scratch/
+docs/
+challenge.md
+
 # OS / IDE
 .DS_Store
 Thumbs.db

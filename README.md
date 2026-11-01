@@ -67,15 +67,9 @@ Resolves coordinates via **OpenStreetMap Nominatim** and meteorological/sunset d
 
 ## 5. Project Structure & Setup Instructions
 
-### Architecture Documents
-* [Domain Glossary](./docs/GLOSSARY.md)
-* [Technical Specification](./docs/SPEC.md)
-* [Tracer-Bullet Tickets](./docs/TICKETS.md)
-* [Architecture Decision Records (`docs/adr/`)](./docs/adr/)
-
 ### Prerequisites
 * **Python 3.11+**
-* **Node.js 18+ / 22+**
+* **Node.js 18+ / 20+**
 
 ### 1. Backend Setup (`backend/`)
 ```powershell
@@ -105,4 +99,11 @@ npm.cmd run build
 
 # Start Vite dev server on http://localhost:5173
 npm.cmd run dev
+```
+
+### 3. Production Container / Google Cloud Run Deployment
+The repository includes a multi-stage `Dockerfile` that builds the React frontend (`frontend/dist`) and serves it alongside the FastAPI backend (`/api/v1`) from a single container on `$PORT` (`8080`).
+```powershell
+docker build -t utsav-ai .
+docker run -p 8080:8080 -e GEMINI_API_KEY="your_key_here" utsav-ai
 ```

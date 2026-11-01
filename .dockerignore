@@ -1,0 +1,35 @@
+# Git & local scratch/docs
+.git
+.gitignore
+.scratch/
+docs/
+challenge.md
+README.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.pytest_cache/
+backend/tests/
+*.db
+*.sqlite3
+
+# Node / Frontend build artifacts (rebuilt cleanly inside Stage 1)
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+
+# Secrets & Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db

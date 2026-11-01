@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
+from pathlib import Path
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
 
 from app.api.routes import router
@@ -99,3 +103,22 @@ app.add_middleware(
 )
 
 app.include_router(router)
+
+# Serve built React frontend in production / Cloud Run single-container deployments
+_default_dist = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+STATIC_DIR = Path(os.getenv("STATIC_DIR", str(_default_dist)))
+
+if STATIC_DIR.is_dir() and (STATIC_DIR / "index.html").is_file():
+    assets_dir = STATIC_DIR / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def serve_spa(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="API endpoint not found")
+        candidate = (STATIC_DIR / full_path).resolve()
+        if full_path and candidate.is_file() and STATIC_DIR.resolve() in candidate.parents:
+            return FileResponse(str(candidate))
+        return FileResponse(str(STATIC_DIR / "index.html"))
+
