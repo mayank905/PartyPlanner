@@ -1,17 +1,23 @@
+"""Pydantic domain schemas and request/response contracts for the UtsavAI API."""
+
 from __future__ import annotations
 
 from enum import Enum
-from typing import Dict, List, Literal, Optional
+from typing import List, Literal, Optional
 from pydantic import BaseModel, Field
 
 
 class EventVertical(str, Enum):
+    """Supported celebration archetypes with calibrated budget & vendor blueprints."""
+
     INTIMATE_WEDDING = "INTIMATE_WEDDING"
     MILESTONE_BIRTHDAY = "MILESTONE_BIRTHDAY"
     COMMUNITY_EVENT = "COMMUNITY_EVENT"
 
 
 class CurrencyCode(str, Enum):
+    """Supported display and budgeting currencies (defaults to Indian Rupee INR)."""
+
     INR = "INR"
     USD = "USD"
     EUR = "EUR"
@@ -19,24 +25,32 @@ class CurrencyCode(str, Enum):
 
 
 class PricingModel(str, Enum):
+    """Deterministic mathematical cost-scaling models for categories and vendors."""
+
     FLAT_FEE = "FLAT_FEE"
     PER_CAPITA = "PER_CAPITA"
     TIERED_CAPACITY = "TIERED_CAPACITY"
 
 
 class SelectionStatus(str, Enum):
+    """Lifecycle selection states for shortlisted or locked vendor candidates."""
+
     SHORTLISTED = "SHORTLISTED"
     LOCKED = "LOCKED"
     REJECTED = "REJECTED"
 
 
 class OutdoorRiskLevel(str, Enum):
+    """Meteorological risk classification for outdoor ceremony blocks."""
+
     LOW = "LOW"
     MODERATE = "MODERATE"
     HIGH = "HIGH"
 
 
 class ViolationType(str, Enum):
+    """Categories of deterministic constraint conflicts surfaced by the engine."""
+
     BUDGET_OVERFLOW = "BUDGET_OVERFLOW"
     CATEGORY_OVERFLOW = "CATEGORY_OVERFLOW"
     VENUE_CAPACITY_EXCEEDED = "VENUE_CAPACITY_EXCEEDED"
@@ -45,11 +59,15 @@ class ViolationType(str, Enum):
 
 
 class ViolationSeverity(str, Enum):
+    """Severity level for active constraint violations."""
+
     WARNING = "WARNING"
     CRITICAL = "CRITICAL"
 
 
 class ConstraintProfileSchema(BaseModel):
+    """Host-defined celebration constraints, budget ceiling, and priority ranking."""
+
     event_vertical: EventVertical = EventVertical.INTIMATE_WEDDING
     currency_code: CurrencyCode = CurrencyCode.INR
     total_budget_limit: float = Field(..., gt=0)
@@ -63,6 +81,8 @@ class ConstraintProfileSchema(BaseModel):
 
 
 class BudgetCategorySchema(BaseModel):
+    """Individual budget line item with deterministic scaling parameters."""
+
     id: str
     name: str
     allocated_amount: float
@@ -77,6 +97,8 @@ class BudgetCategorySchema(BaseModel):
 
 
 class VendorCandidateSchema(BaseModel):
+    """Regional vendor or venue option with capacity, lead time, and pricing rules."""
+
     id: str
     category_id: str
     category_name: str
@@ -91,6 +113,8 @@ class VendorCandidateSchema(BaseModel):
 
 
 class MilestoneTaskSchema(BaseModel):
+    """Pre-event critical-path task anchored relative to the target event date."""
+
     id: str
     title: str
     days_before_event: int
@@ -103,6 +127,8 @@ class MilestoneTaskSchema(BaseModel):
 
 
 class RunOfShowItemSchema(BaseModel):
+    """Day-of schedule block synchronized with local sunset and weather advisories."""
+
     id: str
     start_time: str
     duration_minutes: int
@@ -113,6 +139,8 @@ class RunOfShowItemSchema(BaseModel):
 
 
 class WeatherContextSchema(BaseModel):
+    """Meteorological and golden-hour sunset context for the event location and date."""
+
     location_city: str
     event_date: str
     latitude: float = 24.5854
@@ -126,6 +154,8 @@ class WeatherContextSchema(BaseModel):
 
 
 class ConstraintViolationSchema(BaseModel):
+    """Detected budget, capacity, lead-time, or weather conflict."""
+
     id: str
     violation_type: ViolationType
     severity: ViolationSeverity
@@ -136,6 +166,8 @@ class ConstraintViolationSchema(BaseModel):
 
 
 class CategoryMutationSchema(BaseModel):
+    """Specific category allocation and unit-cost delta within a TradeoffOption."""
+
     category_id: str
     category_name: str
     previous_allocated: float
@@ -149,6 +181,8 @@ class CategoryMutationSchema(BaseModel):
 
 
 class TradeoffOptionSchema(BaseModel):
+    """Actionable resolution path synthesized by the coordinator to resolve violations."""
+
     id: str
     title: str
     badge: str = "Recommended Coordinator Path"
@@ -164,6 +198,8 @@ class TradeoffOptionSchema(BaseModel):
 
 
 class PlanSnapshotSchema(BaseModel):
+    """Metadata summary of a saved PlanSnapshot for rollback history display."""
+
     id: str
     created_at: str
     label: str
@@ -174,6 +210,8 @@ class PlanSnapshotSchema(BaseModel):
 
 
 class CoordinatorChatTurnSchema(BaseModel):
+    """Single user or assistant turn in the grounded AI Coordinator Chat Drawer."""
+
     id: str
     role: Literal["user", "assistant"]
     content: str
@@ -183,6 +221,8 @@ class CoordinatorChatTurnSchema(BaseModel):
 
 
 class EventPlanResponseSchema(BaseModel):
+    """Hydrated Celebration EventPlan returned by the REST API."""
+
     id: str
     title: str
     created_at: str
@@ -201,11 +241,15 @@ class EventPlanResponseSchema(BaseModel):
 
 
 class CreatePlanRequestSchema(BaseModel):
+    """Payload for initializing a new Celebration EventPlan."""
+
     title: str = Field(..., min_length=1)
     constraint_profile: ConstraintProfileSchema
 
 
 class WhatIfRequestSchema(BaseModel):
+    """Payload for non-destructive What-If constraint simulation."""
+
     guest_count: int = Field(..., gt=0)
     total_budget_limit: float = Field(..., gt=0)
     event_date: str
@@ -213,6 +257,8 @@ class WhatIfRequestSchema(BaseModel):
 
 
 class WhatIfEvaluationResponseSchema(BaseModel):
+    """Simulation output containing updated estimates, violations, and TradeoffOptions."""
+
     baseline_total_estimated: float
     what_if_total_estimated: float
     budget_delta: float
@@ -225,18 +271,26 @@ class WhatIfEvaluationResponseSchema(BaseModel):
 
 
 class ApplyTradeoffRequestSchema(BaseModel):
+    """Payload for committing a chosen TradeoffOption after recording a snapshot."""
+
     what_if_constraints: WhatIfRequestSchema
     tradeoff_option: TradeoffOptionSchema
 
 
 class VendorStatusUpdateRequestSchema(BaseModel):
+    """Payload for locking, unlocking, or rejecting a VendorCandidate."""
+
     selection_status: SelectionStatus
 
 
 class ScoutVendorsRequestSchema(BaseModel):
+    """Payload for scouting additional regional vendors for a specific category."""
+
     category_id: str
     custom_focus: Optional[str] = None
 
 
 class ChatRequestSchema(BaseModel):
+    """Payload for sending a user message to the AI Coordinator Chat Drawer."""
+
     message: str = Field(..., min_length=1)

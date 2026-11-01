@@ -1,5 +1,8 @@
+"""FastAPI application entrypoint, middleware configuration, and default celebration seeding."""
+
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Awaitable, Callable
 import json
 import os
 import uuid
@@ -83,7 +86,8 @@ def seed_default_celebration_if_empty() -> None:
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Initialize SQLite schema and seed flagship celebration plan on application startup."""
     init_db()
     seed_default_celebration_if_empty()
     yield
@@ -112,7 +116,10 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def add_security_headers(request: Request, call_next) -> Response:
+async def add_security_headers(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
     """Attach hardened HTTP security headers to all API and SPA responses."""
     response = await call_next(request)
     response.headers["X-Content-Type-Options"] = "nosniff"
@@ -134,11 +141,11 @@ if STATIC_DIR.is_dir() and (STATIC_DIR / "index.html").is_file():
         app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
     @app.get("/{full_path:path}", include_in_schema=False)
-    def serve_spa(full_path: str):
+    def serve_spa(full_path: str) -> FileResponse:
+        """Serve static assets or fallback to SPA index.html for client-side routes."""
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="API endpoint not found")
         candidate = (STATIC_DIR / full_path).resolve()
         if full_path and candidate.is_file() and STATIC_DIR.resolve() in candidate.parents:
             return FileResponse(str(candidate))
         return FileResponse(str(STATIC_DIR / "index.html"))
-

@@ -1,7 +1,9 @@
+"""Database engine configuration, SQLite WAL tuning, and session lifecycle."""
+
 from __future__ import annotations
 
 import os
-from typing import Generator
+from typing import Any, Generator
 from sqlalchemy import event
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -20,7 +22,7 @@ engine = create_engine(
 
 
 @event.listens_for(engine, "connect")
-def _set_sqlite_pragma(dbapi_connection, _connection_record) -> None:
+def _set_sqlite_pragma(dbapi_connection: Any, _connection_record: Any) -> None:
     """Enable WAL journaling and fast synchronous mode for SQLite concurrency & efficiency."""
     cursor = dbapi_connection.cursor()
     try:

@@ -8,6 +8,19 @@ import {
 } from '../types/domain';
 import { formatCurrency } from '../utils/currency';
 
+const DEFAULT_VENDOR_TIER_STEP = 50;
+
+/** Calculate a vendor's projected quote for the active guest count based on its pricing model. */
+function calculateVendorQuote(vendor: VendorCandidate, guestCount: number): number {
+  if (vendor.pricing_model === 'FLAT_FEE') {
+    return vendor.base_cost;
+  }
+  if (vendor.pricing_model === 'PER_CAPITA') {
+    return vendor.base_cost + vendor.per_head_cost * guestCount;
+  }
+  return vendor.base_cost + Math.ceil(guestCount / DEFAULT_VENDOR_TIER_STEP) * vendor.per_head_cost;
+}
+
 interface VendorCoordinatorProps {
   categories: BudgetCategory[];
   vendors: VendorCandidate[];
@@ -78,12 +91,7 @@ export const VendorCoordinator: React.FC<VendorCoordinatorProps> = React.memo(
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 {catVendors.map((v) => {
-                  const vendorQuote =
-                    v.pricing_model === 'FLAT_FEE'
-                      ? v.base_cost
-                      : v.pricing_model === 'PER_CAPITA'
-                      ? v.base_cost + v.per_head_cost * activeGuestCount
-                      : v.base_cost + Math.ceil(activeGuestCount / 50) * v.per_head_cost;
+                  const vendorQuote = calculateVendorQuote(v, activeGuestCount);
                   const capExceeded = activeGuestCount > v.max_capacity;
                   const isLocked = v.selection_status === 'LOCKED';
 

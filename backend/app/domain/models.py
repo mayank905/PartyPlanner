@@ -1,3 +1,5 @@
+"""SQLModel database records for persistent EventPlan and PlanSnapshot storage."""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -10,6 +12,8 @@ def utc_now_iso() -> str:
 
 
 class EventPlanRecord(SQLModel, table=True):
+    """Persistent database record representing an active Celebration EventPlan."""
+
     __tablename__ = "event_plans"
 
     id: str = Field(primary_key=True)
@@ -30,6 +34,8 @@ class EventPlanRecord(SQLModel, table=True):
 
 
 class PlanSnapshotRecord(SQLModel, table=True):
+    """Immutable point-in-time snapshot of an EventPlan for 1-click rollback."""
+
     __tablename__ = "plan_snapshots"
 
     id: str = Field(primary_key=True)

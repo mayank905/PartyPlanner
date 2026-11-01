@@ -1,3 +1,5 @@
+"""Gemini 3 5-model cascade orchestrator with deterministic heuristic coordinator fallback."""
+
 from __future__ import annotations
 
 from functools import lru_cache
@@ -47,10 +49,16 @@ DEFAULT_MODEL_CASCADE: List[str] = [
     "gemini-2.5-flash",
 ]
 
+RESILIENT_MODE = "resilient_coordinator"
+LIVE_GEMINI_MODE = "live_gemini"
+STRUCTURED_OUTPUT_TEMPERATURE = 0.35
+
 T = TypeVar("T", bound=BaseModel)
 
 
 class CoordinatorSettings(BaseSettings):
+    """Environment-backed configuration for the Gemini API key and model cascade."""
+
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
     gemini_api_key: str = ""
     gemini_model_cascade: str = ""
@@ -105,7 +113,7 @@ def invoke_gemini_cascade(
     """
     resolved_key = resolve_api_key(api_key)
     if not resolved_key:
-        return None, "resilient_coordinator", "resilient_coordinator"
+        return None, RESILIENT_MODE, RESILIENT_MODE
 
     cascade = custom_cascade or get_model_cascade()
 
@@ -117,7 +125,7 @@ def invoke_gemini_cascade(
         )
     except Exception as exc:
         logger.warning("Failed to initialize Gemini client; using resilient coordinator: %s", exc)
-        return None, "resilient_coordinator", "resilient_coordinator"
+        return None, RESILIENT_MODE, RESILIENT_MODE
 
     for model_name in cascade:
         try:
@@ -127,21 +135,21 @@ def invoke_gemini_cascade(
                 config={
                     "response_mime_type": "application/json",
                     "response_schema": response_schema,
-                    "temperature": 0.35,
+                    "temperature": STRUCTURED_OUTPUT_TEMPERATURE,
                 },
             )
             if getattr(response, "parsed", None) is not None:
                 parsed = response.parsed
                 if isinstance(parsed, response_schema):
-                    return parsed, model_name, "live_gemini"
-                return response_schema.model_validate(parsed), model_name, "live_gemini"
+                    return parsed, model_name, LIVE_GEMINI_MODE
+                return response_schema.model_validate(parsed), model_name, LIVE_GEMINI_MODE
             if getattr(response, "text", None):
-                return response_schema.model_validate_json(response.text), model_name, "live_gemini"
+                return response_schema.model_validate_json(response.text), model_name, LIVE_GEMINI_MODE
         except Exception as exc:
             logger.info("Model '%s' failed in cascade (%s); advancing to next tier.", model_name, exc)
             continue
 
-    return None, "resilient_coordinator", "resilient_coordinator"
+    return None, RESILIENT_MODE, RESILIENT_MODE
 
 
 def generate_initial_plan(

@@ -1,11 +1,14 @@
+"""REST API route handlers for EventPlans, What-If simulations, Tradeoff diffs, Vendors, and Chat."""
+
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Sequence
 import json
 import uuid
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, Header, HTTPException, status
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 from sqlmodel import Session, select
 
 from app.db import get_session
@@ -58,8 +61,32 @@ _MILESTONES_ADAPTER = TypeAdapter(List[MilestoneTaskSchema])
 _ROS_ADAPTER = TypeAdapter(List[RunOfShowItemSchema])
 _CHAT_ADAPTER = TypeAdapter(List[CoordinatorChatTurnSchema])
 
+DeserializedPlanState = Tuple[
+    ConstraintProfileSchema,
+    WeatherContextSchema,
+    List[BudgetCategorySchema],
+    List[VendorCandidateSchema],
+    List[MilestoneTaskSchema],
+    List[RunOfShowItemSchema],
+    List[CoordinatorChatTurnSchema],
+]
 
-def _deserialize_plan_state(record: EventPlanRecord):
+
+def _get_plan_or_404(plan_id: str, session: Session) -> EventPlanRecord:
+    """Fetch an EventPlanRecord by primary key or raise a 404 HTTPException."""
+    record = session.get(EventPlanRecord, plan_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="EventPlan not found")
+    return record
+
+
+def _dump_models(items: Sequence[BaseModel]) -> str:
+    """Serialize a sequence of Pydantic models into a JSON array string."""
+    return json.dumps([item.model_dump() for item in items])
+
+
+def _deserialize_plan_state(record: EventPlanRecord) -> DeserializedPlanState:
+    """Deserialize all JSON columns of an EventPlanRecord using pre-compiled TypeAdapters."""
     profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
     weather = WeatherContextSchema.model_validate_json(record.weather_context_json)
     categories = _CATEGORIES_ADAPTER.validate_json(record.categories_json)
@@ -75,6 +102,7 @@ def _hydrate_plan_response(
     session: Session,
     preloaded_snapshots: Optional[List[PlanSnapshotRecord]] = None,
 ) -> EventPlanResponseSchema:
+    """Hydrate a complete EventPlanResponseSchema with evaluated constraints and snapshots."""
     profile, weather, categories, vendors, milestones, run_of_show, chat_history = _deserialize_plan_state(record)
 
     updated_categories, violations = evaluate_plan_constraints(
@@ -126,11 +154,20 @@ def _hydrate_plan_response(
     )
 
 
+def _save_and_hydrate(record: EventPlanRecord, session: Session) -> EventPlanResponseSchema:
+    """Persist an updated EventPlanRecord and return its hydrated API response."""
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+    return _hydrate_plan_response(record, session)
+
+
 def _create_snapshot(
     record: EventPlanRecord,
     label: str,
     session: Session,
 ) -> PlanSnapshotRecord:
+    """Record an immutable PlanSnapshotRecord and prune old snapshots beyond retention cap."""
     profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
     categories = _CATEGORIES_ADAPTER.validate_json(record.categories_json)
     total_est = round(sum(c.estimated_amount for c in categories), 2)
@@ -151,7 +188,6 @@ def _create_snapshot(
     )
     session.add(snap)
 
-    # Prune oldest snapshots beyond retention cap to prevent unbounded table growth
     existing_snaps = session.exec(
         select(PlanSnapshotRecord)
         .where(PlanSnapshotRecord.plan_id == record.id)
@@ -167,7 +203,8 @@ def _create_snapshot(
 @router.get("/system/status")
 def get_system_status(
     x_gemini_api_key: Optional[str] = Header(default=None),
-):
+) -> Dict[str, Any]:
+    """Return active coordinator mode, default currency, and 5-model cascade configuration."""
     has_key = resolve_api_key(x_gemini_api_key) is not None
     cascade = get_model_cascade()
     return {
@@ -179,12 +216,12 @@ def get_system_status(
 
 
 @router.get("/plans", response_model=List[EventPlanResponseSchema])
-def list_plans(session: Session = Depends(get_session)):
+def list_plans(session: Session = Depends(get_session)) -> List[EventPlanResponseSchema]:
+    """List all saved EventPlans ordered by most recently updated using batch snapshot loading."""
     records = session.exec(select(EventPlanRecord).order_by(EventPlanRecord.updated_at.desc())).all()
     if not records:
         return []
 
-    # Batch-load all snapshots in a single query to avoid N+1 database round-trips
     plan_ids = [r.id for r in records]
     all_snapshots = session.exec(
         select(PlanSnapshotRecord)
@@ -207,7 +244,8 @@ def create_plan(
     payload: CreatePlanRequestSchema,
     session: Session = Depends(get_session),
     x_gemini_api_key: Optional[str] = Header(default=None),
-):
+) -> EventPlanResponseSchema:
+    """Create a new EventPlan initialized via the Gemini 3 cascade or calibrated heuristic coordinator."""
     profile = payload.constraint_profile
     weather = fetch_weather_context(profile.location_city, profile.event_date)
     blueprint, active_model, mode = generate_initial_plan(
@@ -236,23 +274,19 @@ def create_plan(
         coordinator_mode=mode,
         constraint_profile_json=profile.model_dump_json(),
         weather_context_json=weather.model_dump_json(),
-        categories_json=json.dumps([c.model_dump() for c in blueprint.categories]),
-        vendors_json=json.dumps([v.model_dump() for v in blueprint.vendors]),
-        milestones_json=json.dumps([m.model_dump() for m in blueprint.milestones]),
-        run_of_show_json=json.dumps([r.model_dump() for r in blueprint.run_of_show]),
-        chat_history_json=json.dumps([welcome_turn.model_dump()]),
+        categories_json=_dump_models(blueprint.categories),
+        vendors_json=_dump_models(blueprint.vendors),
+        milestones_json=_dump_models(blueprint.milestones),
+        run_of_show_json=_dump_models(blueprint.run_of_show),
+        chat_history_json=_dump_models([welcome_turn]),
     )
-    session.add(record)
-    session.commit()
-    session.refresh(record)
-    return _hydrate_plan_response(record, session)
+    return _save_and_hydrate(record, session)
 
 
 @router.get("/plans/{plan_id}", response_model=EventPlanResponseSchema)
-def get_plan(plan_id: str, session: Session = Depends(get_session)):
-    record = session.get(EventPlanRecord, plan_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="EventPlan not found")
+def get_plan(plan_id: str, session: Session = Depends(get_session)) -> EventPlanResponseSchema:
+    """Retrieve a single EventPlan by ID."""
+    record = _get_plan_or_404(plan_id, session)
     return _hydrate_plan_response(record, session)
 
 
@@ -262,10 +296,9 @@ def evaluate_what_if(
     payload: WhatIfRequestSchema,
     session: Session = Depends(get_session),
     x_gemini_api_key: Optional[str] = Header(default=None),
-):
-    record = session.get(EventPlanRecord, plan_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="EventPlan not found")
+) -> WhatIfEvaluationResponseSchema:
+    """Simulate guest count, budget ceiling, or event date changes and synthesize TradeoffOptions."""
+    record = _get_plan_or_404(plan_id, session)
 
     base_profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
     categories = _CATEGORIES_ADAPTER.validate_json(record.categories_json)
@@ -317,19 +350,16 @@ def apply_tradeoff(
     plan_id: str,
     payload: ApplyTradeoffRequestSchema,
     session: Session = Depends(get_session),
-):
-    record = session.get(EventPlanRecord, plan_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="EventPlan not found")
+) -> EventPlanResponseSchema:
+    """Save an undo snapshot and apply the selected TradeoffOption mutations to the EventPlan."""
+    record = _get_plan_or_404(plan_id, session)
 
-    # 1. Record immutable PlanSnapshot prior to mutation
     _create_snapshot(
         record=record,
         label=f"Before {payload.tradeoff_option.title}",
         session=session,
     )
 
-    # 2. Apply constraint updates + TradeoffOption category mutations
     profile, _, categories, _, milestones, run_of_show, _ = _deserialize_plan_state(record)
     final_guest_count = payload.tradeoff_option.suggested_guest_count or payload.what_if_constraints.guest_count
     final_budget_limit = payload.tradeoff_option.suggested_budget_limit or payload.what_if_constraints.total_budget_limit
@@ -350,7 +380,7 @@ def apply_tradeoff(
     for cat in categories:
         mut = mutation_map.get(cat.id)
         if mut is not None:
-            cat_updates = {
+            cat_updates: Dict[str, Any] = {
                 "allocated_amount": mut.new_allocated,
                 "base_cost": mut.new_base_cost,
                 "per_head_cost": mut.new_per_head_cost,
@@ -375,15 +405,12 @@ def apply_tradeoff(
 
     record.constraint_profile_json = updated_profile.model_dump_json()
     record.weather_context_json = weather.model_dump_json()
-    record.categories_json = json.dumps([c.model_dump() for c in mutated_categories])
-    record.milestones_json = json.dumps([m.model_dump() for m in updated_milestones])
-    record.run_of_show_json = json.dumps([r.model_dump() for r in updated_run_of_show])
+    record.categories_json = _dump_models(mutated_categories)
+    record.milestones_json = _dump_models(updated_milestones)
+    record.run_of_show_json = _dump_models(updated_run_of_show)
     record.updated_at = utc_now_iso()
 
-    session.add(record)
-    session.commit()
-    session.refresh(record)
-    return _hydrate_plan_response(record, session)
+    return _save_and_hydrate(record, session)
 
 
 @router.post("/plans/{plan_id}/snapshots/{snapshot_id}/restore", response_model=EventPlanResponseSchema)
@@ -391,10 +418,9 @@ def restore_snapshot(
     plan_id: str,
     snapshot_id: str,
     session: Session = Depends(get_session),
-):
-    record = session.get(EventPlanRecord, plan_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="EventPlan not found")
+) -> EventPlanResponseSchema:
+    """Restore an EventPlan to a previously captured PlanSnapshot state."""
+    record = _get_plan_or_404(plan_id, session)
 
     snap = session.get(PlanSnapshotRecord, snapshot_id)
     if not snap or snap.plan_id != plan_id:
@@ -407,10 +433,7 @@ def restore_snapshot(
     record.run_of_show_json = snap.run_of_show_json
     record.updated_at = utc_now_iso()
 
-    session.add(record)
-    session.commit()
-    session.refresh(record)
-    return _hydrate_plan_response(record, session)
+    return _save_and_hydrate(record, session)
 
 
 @router.post("/plans/{plan_id}/vendors/{vendor_id}/status", response_model=EventPlanResponseSchema)
@@ -419,14 +442,13 @@ def update_vendor_status(
     vendor_id: str,
     payload: VendorStatusUpdateRequestSchema,
     session: Session = Depends(get_session),
-):
-    record = session.get(EventPlanRecord, plan_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="EventPlan not found")
+) -> EventPlanResponseSchema:
+    """Lock, shortlist, or release a VendorCandidate and synchronize category committed spend."""
+    record = _get_plan_or_404(plan_id, session)
 
     profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
-    vendors = [VendorCandidateSchema.model_validate(v) for v in json.loads(record.vendors_json)]
-    categories = [BudgetCategorySchema.model_validate(c) for c in json.loads(record.categories_json)]
+    vendors = _VENDORS_ADAPTER.validate_json(record.vendors_json)
+    categories = _CATEGORIES_ADAPTER.validate_json(record.categories_json)
 
     target_vendor = next((v for v in vendors if v.id == vendor_id), None)
     if not target_vendor:
@@ -436,13 +458,15 @@ def update_vendor_status(
     for v in vendors:
         if v.id == vendor_id:
             updated_vendors.append(v.model_copy(update={"selection_status": payload.selection_status}))
-        elif payload.selection_status == SelectionStatus.LOCKED and v.category_id == target_vendor.category_id and v.selection_status == SelectionStatus.LOCKED:
-            # Unlock previously locked vendor in same category
+        elif (
+            payload.selection_status == SelectionStatus.LOCKED
+            and v.category_id == target_vendor.category_id
+            and v.selection_status == SelectionStatus.LOCKED
+        ):
             updated_vendors.append(v.model_copy(update={"selection_status": SelectionStatus.SHORTLISTED}))
         else:
             updated_vendors.append(v)
 
-    # Update committed_amount on the category
     updated_categories: List[BudgetCategorySchema] = []
     for c in categories:
         if c.id == target_vendor.category_id:
@@ -454,14 +478,11 @@ def update_vendor_status(
         else:
             updated_categories.append(c)
 
-    record.vendors_json = json.dumps([v.model_dump() for v in updated_vendors])
-    record.categories_json = json.dumps([c.model_dump() for c in updated_categories])
+    record.vendors_json = _dump_models(updated_vendors)
+    record.categories_json = _dump_models(updated_categories)
     record.updated_at = utc_now_iso()
 
-    session.add(record)
-    session.commit()
-    session.refresh(record)
-    return _hydrate_plan_response(record, session)
+    return _save_and_hydrate(record, session)
 
 
 @router.post("/plans/{plan_id}/scout-vendors", response_model=EventPlanResponseSchema)
@@ -470,14 +491,13 @@ def scout_vendors(
     payload: ScoutVendorsRequestSchema,
     session: Session = Depends(get_session),
     x_gemini_api_key: Optional[str] = Header(default=None),
-):
-    record = session.get(EventPlanRecord, plan_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="EventPlan not found")
+) -> EventPlanResponseSchema:
+    """Scout additional regionally calibrated VendorCandidates for a specific BudgetCategory."""
+    record = _get_plan_or_404(plan_id, session)
 
     profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
-    categories = [BudgetCategorySchema.model_validate(c) for c in json.loads(record.categories_json)]
-    vendors = [VendorCandidateSchema.model_validate(v) for v in json.loads(record.vendors_json)]
+    categories = _CATEGORIES_ADAPTER.validate_json(record.categories_json)
+    vendors = _VENDORS_ADAPTER.validate_json(record.vendors_json)
 
     target_cat = next((c for c in categories if c.id == payload.category_id), None)
     if not target_cat:
@@ -491,15 +511,12 @@ def scout_vendors(
     )
 
     vendors.extend(new_vendors)
-    record.vendors_json = json.dumps([v.model_dump() for v in vendors])
+    record.vendors_json = _dump_models(vendors)
     record.active_model = active_model
     record.coordinator_mode = mode
     record.updated_at = utc_now_iso()
 
-    session.add(record)
-    session.commit()
-    session.refresh(record)
-    return _hydrate_plan_response(record, session)
+    return _save_and_hydrate(record, session)
 
 
 @router.post("/plans/{plan_id}/milestones/{milestone_id}/toggle", response_model=EventPlanResponseSchema)
@@ -507,12 +524,11 @@ def toggle_milestone(
     plan_id: str,
     milestone_id: str,
     session: Session = Depends(get_session),
-):
-    record = session.get(EventPlanRecord, plan_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="EventPlan not found")
+) -> EventPlanResponseSchema:
+    """Toggle the completion state of a pre-event MilestoneTask."""
+    record = _get_plan_or_404(plan_id, session)
 
-    milestones = [MilestoneTaskSchema.model_validate(m) for m in json.loads(record.milestones_json)]
+    milestones = _MILESTONES_ADAPTER.validate_json(record.milestones_json)
     found = False
     updated: List[MilestoneTaskSchema] = []
     for m in milestones:
@@ -525,13 +541,10 @@ def toggle_milestone(
     if not found:
         raise HTTPException(status_code=404, detail="MilestoneTask not found")
 
-    record.milestones_json = json.dumps([m.model_dump() for m in updated])
+    record.milestones_json = _dump_models(updated)
     record.updated_at = utc_now_iso()
 
-    session.add(record)
-    session.commit()
-    session.refresh(record)
-    return _hydrate_plan_response(record, session)
+    return _save_and_hydrate(record, session)
 
 
 @router.post("/plans/{plan_id}/timeline/optimize", response_model=EventPlanResponseSchema)
@@ -539,10 +552,9 @@ def optimize_plan_timeline(
     plan_id: str,
     session: Session = Depends(get_session),
     x_gemini_api_key: Optional[str] = Header(default=None),
-):
-    record = session.get(EventPlanRecord, plan_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="EventPlan not found")
+) -> EventPlanResponseSchema:
+    """Re-anchor MilestoneTasks and align the day-of Run-of-Show schedule around local sunset."""
+    record = _get_plan_or_404(plan_id, session)
 
     profile, weather, _, _, milestones, run_of_show, _ = _deserialize_plan_state(record)
     updated_milestones, updated_ros, active_model, mode = optimize_timeline_schedule(
@@ -553,16 +565,13 @@ def optimize_plan_timeline(
         api_key=x_gemini_api_key,
     )
 
-    record.milestones_json = json.dumps([m.model_dump() for m in updated_milestones])
-    record.run_of_show_json = json.dumps([r.model_dump() for r in updated_ros])
+    record.milestones_json = _dump_models(updated_milestones)
+    record.run_of_show_json = _dump_models(updated_ros)
     record.active_model = active_model
     record.coordinator_mode = mode
     record.updated_at = utc_now_iso()
 
-    session.add(record)
-    session.commit()
-    session.refresh(record)
-    return _hydrate_plan_response(record, session)
+    return _save_and_hydrate(record, session)
 
 
 @router.post("/plans/{plan_id}/chat", response_model=EventPlanResponseSchema)
@@ -571,13 +580,11 @@ def chat_with_plan_coordinator(
     payload: ChatRequestSchema,
     session: Session = Depends(get_session),
     x_gemini_api_key: Optional[str] = Header(default=None),
-):
-    record = session.get(EventPlanRecord, plan_id)
-    if not record:
-        raise HTTPException(status_code=404, detail="EventPlan not found")
+) -> EventPlanResponseSchema:
+    """Send a host message to the AI Coordinator and append the grounded response turn."""
+    record = _get_plan_or_404(plan_id, session)
 
     profile, weather, categories, vendors, _, run_of_show, chat_history = _deserialize_plan_state(record)
-
     updated_categories, violations = evaluate_plan_constraints(profile, categories, vendors, weather)
 
     user_turn = CoordinatorChatTurnSchema(
@@ -610,12 +617,9 @@ def chat_with_plan_coordinator(
     )
     chat_history.append(assistant_turn)
 
-    record.chat_history_json = json.dumps([t.model_dump() for t in chat_history])
+    record.chat_history_json = _dump_models(chat_history)
     record.active_model = active_model
     record.coordinator_mode = mode
     record.updated_at = utc_now_iso()
 
-    session.add(record)
-    session.commit()
-    session.refresh(record)
-    return _hydrate_plan_response(record, session)
+    return _save_and_hydrate(record, session)

@@ -1,3 +1,5 @@
+"""Deterministic financial, capacity, lead-time, and weather constraint evaluation engine."""
+
 from __future__ import annotations
 
 import math
@@ -17,6 +19,19 @@ from app.domain.schemas import (
     ViolationType,
     WeatherContextSchema,
 )
+
+DEFAULT_TIER_STEP = 50
+DEFAULT_FALLBACK_DAYS_AHEAD = 90
+CATEGORY_OVERFLOW_TOLERANCE = 1.05
+CONTINGENCY_KEYWORDS = ("contingency", "tent", "weather")
+
+
+def _parse_event_date(event_date_str: str, reference_date: date) -> date:
+    """Parse an ISO-8601 date prefix or return a safe fallback relative to reference_date."""
+    try:
+        return date.fromisoformat(event_date_str[:10])
+    except ValueError:
+        return reference_date + timedelta(days=DEFAULT_FALLBACK_DAYS_AHEAD)
 
 
 def calculate_category_estimate(category: BudgetCategorySchema, guest_count: int) -> float:
@@ -44,7 +59,7 @@ def calculate_vendor_estimate(vendor: VendorCandidateSchema, guest_count: int) -
     if vendor.pricing_model == PricingModel.PER_CAPITA:
         return round(vendor.base_cost + (vendor.per_head_cost * guest_count), 2)
     if vendor.pricing_model == PricingModel.TIERED_CAPACITY:
-        tiers = math.ceil(guest_count / 50)
+        tiers = math.ceil(guest_count / DEFAULT_TIER_STEP)
         return round(vendor.base_cost + (tiers * vendor.per_head_cost), 2)
     return round(vendor.base_cost, 2)
 
@@ -59,10 +74,7 @@ def recalculate_milestones_for_date(
     whose target due_date is earlier than reference_date and not yet completed.
     """
     ref = reference_date or date.today()
-    try:
-        ev_date = date.fromisoformat(event_date_str[:10])
-    except ValueError:
-        ev_date = ref + timedelta(days=90)
+    ev_date = _parse_event_date(event_date_str, ref)
 
     updated: List[MilestoneTaskSchema] = []
     for ms in milestones:
@@ -79,29 +91,15 @@ def recalculate_milestones_for_date(
     return updated
 
 
-def evaluate_plan_constraints(
+def _evaluate_category_estimates(
     profile: ConstraintProfileSchema,
     categories: List[BudgetCategorySchema],
     vendors: List[VendorCandidateSchema],
-    weather: WeatherContextSchema,
-    reference_date: Optional[date] = None,
 ) -> Tuple[List[BudgetCategorySchema], List[ConstraintViolationSchema]]:
-    """
-    Re-evaluate all BudgetCategory estimates for profile.guest_count and detect all
-    ConstraintViolations (BUDGET_OVERFLOW, CATEGORY_OVERFLOW, VENUE_CAPACITY_EXCEEDED,
-    LEAD_TIME_COMPRESSED, WEATHER_CONTINGENCY_MISSING).
-    """
-    ref = reference_date or date.today()
-    try:
-        ev_date = date.fromisoformat(profile.event_date[:10])
-    except ValueError:
-        ev_date = ref + timedelta(days=90)
-    days_until_event = (ev_date - ref).days
-
+    """Recalculate category estimates for the active guest count and flag category overflows."""
     updated_categories: List[BudgetCategorySchema] = []
     violations: List[ConstraintViolationSchema] = []
 
-    # Map locked vendors by category
     locked_by_category = {
         v.category_id: v for v in vendors if v.selection_status == SelectionStatus.LOCKED
     }
@@ -110,7 +108,10 @@ def evaluate_plan_constraints(
         locked_vendor = locked_by_category.get(cat.id)
         cat_est = calculate_category_estimate(cat, profile.guest_count)
         if locked_vendor is not None:
-            if locked_vendor.pricing_model == PricingModel.TIERED_CAPACITY and locked_vendor.per_head_cost == 0:
+            if (
+                locked_vendor.pricing_model == PricingModel.TIERED_CAPACITY
+                and locked_vendor.per_head_cost == 0
+            ):
                 est = cat_est
             else:
                 est = calculate_vendor_estimate(locked_vendor, profile.guest_count)
@@ -127,7 +128,7 @@ def evaluate_plan_constraints(
         )
         updated_categories.append(new_cat)
 
-        if est > new_cat.allocated_amount * 1.05:
+        if est > new_cat.allocated_amount * CATEGORY_OVERFLOW_TOLERANCE:
             overflow = round(est - new_cat.allocated_amount, 2)
             violations.append(
                 ConstraintViolationSchema(
@@ -144,78 +145,133 @@ def evaluate_plan_constraints(
                 )
             )
 
-    total_estimated = round(sum(c.estimated_amount for c in updated_categories), 2)
-    if total_estimated > profile.total_budget_limit:
-        overflow = round(total_estimated - profile.total_budget_limit, 2)
-        violations.append(
-            ConstraintViolationSchema(
-                id="viol-total-budget",
-                violation_type=ViolationType.BUDGET_OVERFLOW,
-                severity=ViolationSeverity.CRITICAL,
-                title="Total Celebration Budget Exceeded",
-                description=(
-                    f"Projected total spend is {total_estimated:,.0f} against your hard limit of "
-                    f"{profile.total_budget_limit:,.0f} (overflow of {overflow:,.0f})."
-                ),
-                affected_category_id=None,
-                overflow_amount=overflow,
-            )
-        )
+    return updated_categories, violations
 
-    # Check locked or shortlisted venue capacity and vendor lead times
+
+def _check_total_budget_overflow(
+    profile: ConstraintProfileSchema,
+    categories: List[BudgetCategorySchema],
+) -> Optional[ConstraintViolationSchema]:
+    """Return a critical BUDGET_OVERFLOW violation if total estimated spend exceeds the hard limit."""
+    total_estimated = round(sum(c.estimated_amount for c in categories), 2)
+    if total_estimated <= profile.total_budget_limit:
+        return None
+
+    overflow = round(total_estimated - profile.total_budget_limit, 2)
+    return ConstraintViolationSchema(
+        id="viol-total-budget",
+        violation_type=ViolationType.BUDGET_OVERFLOW,
+        severity=ViolationSeverity.CRITICAL,
+        title="Total Celebration Budget Exceeded",
+        description=(
+            f"Projected total spend is {total_estimated:,.0f} against your hard limit of "
+            f"{profile.total_budget_limit:,.0f} (overflow of {overflow:,.0f})."
+        ),
+        affected_category_id=None,
+        overflow_amount=overflow,
+    )
+
+
+def _evaluate_vendor_constraints(
+    profile: ConstraintProfileSchema,
+    vendors: List[VendorCandidateSchema],
+    days_until_event: int,
+) -> List[ConstraintViolationSchema]:
+    """Check locked vendor max capacity limits and minimum booking lead times."""
+    violations: List[ConstraintViolationSchema] = []
     for vendor in vendors:
-        if vendor.selection_status == SelectionStatus.LOCKED:
-            if profile.guest_count > vendor.max_capacity:
-                violations.append(
-                    ConstraintViolationSchema(
-                        id=f"viol-cap-{vendor.id}",
-                        violation_type=ViolationType.VENUE_CAPACITY_EXCEEDED,
-                        severity=ViolationSeverity.CRITICAL,
-                        title=f"Guest Count Exceeds {vendor.name} Max Capacity",
-                        description=(
-                            f"Locked vendor '{vendor.name}' holds at most {vendor.max_capacity} guests, "
-                            f"but current guest count is {profile.guest_count} (+{profile.guest_count - vendor.max_capacity} over)."
-                        ),
-                        affected_category_id=vendor.category_id,
-                        overflow_amount=float(profile.guest_count - vendor.max_capacity),
-                    )
-                )
-            if days_until_event < vendor.lead_time_days:
-                violations.append(
-                    ConstraintViolationSchema(
-                        id=f"viol-lead-{vendor.id}",
-                        violation_type=ViolationType.LEAD_TIME_COMPRESSED,
-                        severity=ViolationSeverity.WARNING,
-                        title=f"Compressed Booking Lead Time for {vendor.name}",
-                        description=(
-                            f"'{vendor.name}' requires {vendor.lead_time_days} days lead time, "
-                            f"but the event date is in {max(0, days_until_event)} days."
-                        ),
-                        affected_category_id=vendor.category_id,
-                        overflow_amount=float(vendor.lead_time_days - days_until_event),
-                    )
-                )
+        if vendor.selection_status != SelectionStatus.LOCKED:
+            continue
 
-    # Check weather contingency if outdoor risk is HIGH and no contingency/tent category covers it
-    if weather.outdoor_risk_level == OutdoorRiskLevel.HIGH:
-        has_contingency_cat = any(
-            "contingency" in c.name.lower() or "tent" in c.name.lower() or "weather" in c.notes.lower()
-            for c in updated_categories
-        )
-        if not has_contingency_cat:
+        if profile.guest_count > vendor.max_capacity:
             violations.append(
                 ConstraintViolationSchema(
-                    id="viol-weather-contingency",
-                    violation_type=ViolationType.WEATHER_CONTINGENCY_MISSING,
-                    severity=ViolationSeverity.WARNING,
-                    title="High Outdoor Weather Risk Without Waterproof Contingency",
+                    id=f"viol-cap-{vendor.id}",
+                    violation_type=ViolationType.VENUE_CAPACITY_EXCEEDED,
+                    severity=ViolationSeverity.CRITICAL,
+                    title=f"Guest Count Exceeds {vendor.name} Max Capacity",
                     description=(
-                        f"{weather.location_city} on {weather.event_date} shows {weather.precipitation_prob_pct:.0f}% "
-                        f"rain risk. Add a waterproof shamiana/tent contingency buffer."
+                        f"Locked vendor '{vendor.name}' holds at most {vendor.max_capacity} guests, "
+                        f"but current guest count is {profile.guest_count} (+{profile.guest_count - vendor.max_capacity} over)."
                     ),
-                    affected_category_id=None,
-                    overflow_amount=0.0,
+                    affected_category_id=vendor.category_id,
+                    overflow_amount=float(profile.guest_count - vendor.max_capacity),
                 )
             )
+
+        if days_until_event < vendor.lead_time_days:
+            violations.append(
+                ConstraintViolationSchema(
+                    id=f"viol-lead-{vendor.id}",
+                    violation_type=ViolationType.LEAD_TIME_COMPRESSED,
+                    severity=ViolationSeverity.WARNING,
+                    title=f"Compressed Booking Lead Time for {vendor.name}",
+                    description=(
+                        f"'{vendor.name}' requires {vendor.lead_time_days} days lead time, "
+                        f"but the event date is in {max(0, days_until_event)} days."
+                    ),
+                    affected_category_id=vendor.category_id,
+                    overflow_amount=float(vendor.lead_time_days - days_until_event),
+                )
+            )
+    return violations
+
+
+def _check_weather_contingency(
+    weather: WeatherContextSchema,
+    categories: List[BudgetCategorySchema],
+) -> Optional[ConstraintViolationSchema]:
+    """Check whether high outdoor weather risk is covered by a waterproof contingency category."""
+    if weather.outdoor_risk_level != OutdoorRiskLevel.HIGH:
+        return None
+
+    has_contingency_cat = any(
+        any(kw in c.name.lower() or kw in c.notes.lower() for kw in CONTINGENCY_KEYWORDS)
+        for c in categories
+    )
+    if has_contingency_cat:
+        return None
+
+    return ConstraintViolationSchema(
+        id="viol-weather-contingency",
+        violation_type=ViolationType.WEATHER_CONTINGENCY_MISSING,
+        severity=ViolationSeverity.WARNING,
+        title="High Outdoor Weather Risk Without Waterproof Contingency",
+        description=(
+            f"{weather.location_city} on {weather.event_date} shows {weather.precipitation_prob_pct:.0f}% "
+            f"rain risk. Add a waterproof shamiana/tent contingency buffer."
+        ),
+        affected_category_id=None,
+        overflow_amount=0.0,
+    )
+
+
+def evaluate_plan_constraints(
+    profile: ConstraintProfileSchema,
+    categories: List[BudgetCategorySchema],
+    vendors: List[VendorCandidateSchema],
+    weather: WeatherContextSchema,
+    reference_date: Optional[date] = None,
+) -> Tuple[List[BudgetCategorySchema], List[ConstraintViolationSchema]]:
+    """
+    Re-evaluate all BudgetCategory estimates for profile.guest_count and detect all
+    ConstraintViolations (BUDGET_OVERFLOW, CATEGORY_OVERFLOW, VENUE_CAPACITY_EXCEEDED,
+    LEAD_TIME_COMPRESSED, WEATHER_CONTINGENCY_MISSING).
+    """
+    ref = reference_date or date.today()
+    ev_date = _parse_event_date(profile.event_date, ref)
+    days_until_event = (ev_date - ref).days
+
+    updated_categories, violations = _evaluate_category_estimates(profile, categories, vendors)
+
+    budget_violation = _check_total_budget_overflow(profile, updated_categories)
+    if budget_violation is not None:
+        violations.append(budget_violation)
+
+    violations.extend(_evaluate_vendor_constraints(profile, vendors, days_until_event))
+
+    weather_violation = _check_weather_contingency(weather, updated_categories)
+    if weather_violation is not None:
+        violations.append(weather_violation)
 
     return updated_categories, violations
