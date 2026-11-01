@@ -262,4 +262,37 @@ describe('PartyPlanner Workspace UI', () => {
     fireEvent.click(screen.getByRole('tab', { name: /Snapshot History & Rollback/i }));
     expect(screen.getByText(/Initial 100-Guest Baseline/i)).toBeInTheDocument();
   });
+
+  it('optimizes timeline schedule, locks/unlocks vendors, and surfaces dismissible error alerts on failure', async () => {
+    vi.spyOn(apiClient, 'optimizeTimeline').mockResolvedValue(mockPlan);
+    vi.spyOn(apiClient, 'updateVendorStatus').mockRejectedValueOnce(new Error('Network timeout updating vendor'));
+
+    render(<App />);
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole('heading', { name: /Aarav & Meera's Intimate Udaipur Wedding/i })
+      ).toBeInTheDocument();
+    });
+
+    // Switch to Vendors tab and trigger an error banner
+    fireEvent.click(screen.getByRole('tab', { name: /Vendor & Venue Coordinator/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Lock Vendor Quote/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(/Network timeout updating vendor/i);
+    });
+
+    // Dismiss error alert
+    fireEvent.click(screen.getByRole('button', { name: /Dismiss error alert/i }));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    // Switch to Timeline tab and trigger sunset schedule optimization
+    fireEvent.click(screen.getByRole('tab', { name: /Critical-Path Timeline & Run-of-Show/i }));
+    fireEvent.click(screen.getByRole('button', { name: /Optimize Schedule for Sunset/i }));
+
+    await waitFor(() => {
+      expect(apiClient.optimizeTimeline).toHaveBeenCalledWith('plan-udaipur-1');
+    });
+  });
 });

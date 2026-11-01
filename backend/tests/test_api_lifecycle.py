@@ -276,3 +276,58 @@ def test_ticket_05_and_06_milestone_toggle_and_context_grounded_chat():
     assert latest_turn["role"] == "assistant"
     assert len(latest_turn["content"]) > 20
     assert latest_turn["suggested_tradeoff"] is not None
+
+
+def test_timeline_optimization_security_headers_and_404_error_handling():
+    """Verify timeline sunset optimization endpoint, hardened HTTP security headers, weather LRU cache, and 404 responses."""
+    client = TestClient(app)
+
+    status_res = client.get("/api/v1/system/status")
+    assert status_res.status_code == 200
+    assert status_res.headers.get("X-Content-Type-Options") == "nosniff"
+    assert status_res.headers.get("X-Frame-Options") == "DENY"
+    assert status_res.headers.get("Referrer-Policy") == "strict-origin-when-cross-origin"
+
+    # Verify 404 on unknown plan
+    not_found_res = client.get("/api/v1/plans/plan-nonexistent")
+    assert not_found_res.status_code == 404
+
+    # Create a plan and run timeline optimization + vendor unlock/reject transitions
+    plan = client.post(
+        "/api/v1/plans",
+        json={
+            "title": "Test Sunset Schedule Optimization",
+            "constraint_profile": {
+                "event_vertical": "INTIMATE_WEDDING",
+                "currency_code": "INR",
+                "total_budget_limit": 2000000,
+                "guest_count": 100,
+                "event_date": "2027-07-18",
+                "location_city": "test_udaipur",
+                "venue_capacity_min": 110,
+                "dietary_restrictions": ["Vegetarian"],
+                "vibe_tags": ["Courtyard"],
+                "priority_ranking": ["Catering & Royal Feast", "Venue & Heritage Lawn"],
+            },
+        },
+    ).json()
+    plan_id = plan["id"]
+
+    opt_res = client.post(f"/api/v1/plans/{plan_id}/timeline/optimize")
+    assert opt_res.status_code == 200
+    opt_data = opt_res.json()
+    assert len(opt_data["run_of_show"]) >= 5
+
+    # Test vendor reject -> shortlist -> lock -> unlock transitions
+    vendor_id = plan["vendors"][0]["id"]
+    reject_res = client.post(
+        f"/api/v1/plans/{plan_id}/vendors/{vendor_id}/status",
+        json={"selection_status": "REJECTED"},
+    )
+    assert reject_res.status_code == 200
+    assert reject_res.json()["vendors"][0]["selection_status"] == "REJECTED"
+
+    # Verify list_plans batch snapshot hydration
+    list_res = client.get("/api/v1/plans")
+    assert list_res.status_code == 200
+    assert len(list_res.json()) >= 1

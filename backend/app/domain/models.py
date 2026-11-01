@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
-from typing import Optional
 from sqlmodel import Field, SQLModel
 
 
 def utc_now_iso() -> str:
+    """Return current UTC timestamp in ISO-8601 format."""
     return datetime.now(timezone.utc).isoformat()
 
 
@@ -16,7 +15,7 @@ class EventPlanRecord(SQLModel, table=True):
     id: str = Field(primary_key=True)
     title: str
     created_at: str = Field(default_factory=utc_now_iso)
-    updated_at: str = Field(default_factory=utc_now_iso)
+    updated_at: str = Field(default_factory=utc_now_iso, index=True)
     active_model: str = Field(default="resilient_coordinator")
     coordinator_mode: str = Field(default="resilient_coordinator")
 
@@ -35,7 +34,7 @@ class PlanSnapshotRecord(SQLModel, table=True):
 
     id: str = Field(primary_key=True)
     plan_id: str = Field(index=True)
-    created_at: str = Field(default_factory=utc_now_iso)
+    created_at: str = Field(default_factory=utc_now_iso, index=True)
     label: str
     guest_count: int
     total_budget_limit: float

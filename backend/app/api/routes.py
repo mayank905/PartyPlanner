@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from collections import defaultdict
 import json
 import uuid
-from typing import List, Optional
+from typing import Dict, List, Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from pydantic import TypeAdapter
 from sqlmodel import Session, select
 
 from app.db import get_session
@@ -47,21 +49,31 @@ from app.services.weather_service import fetch_weather_context
 
 router = APIRouter(prefix="/api/v1")
 
+MAX_SNAPSHOTS_PER_PLAN = 25
+
+# Pre-compiled Pydantic TypeAdapters for high-throughput JSON list parsing
+_CATEGORIES_ADAPTER = TypeAdapter(List[BudgetCategorySchema])
+_VENDORS_ADAPTER = TypeAdapter(List[VendorCandidateSchema])
+_MILESTONES_ADAPTER = TypeAdapter(List[MilestoneTaskSchema])
+_ROS_ADAPTER = TypeAdapter(List[RunOfShowItemSchema])
+_CHAT_ADAPTER = TypeAdapter(List[CoordinatorChatTurnSchema])
+
 
 def _deserialize_plan_state(record: EventPlanRecord):
     profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
     weather = WeatherContextSchema.model_validate_json(record.weather_context_json)
-    categories = [BudgetCategorySchema.model_validate(c) for c in json.loads(record.categories_json)]
-    vendors = [VendorCandidateSchema.model_validate(v) for v in json.loads(record.vendors_json)]
-    milestones = [MilestoneTaskSchema.model_validate(m) for m in json.loads(record.milestones_json)]
-    run_of_show = [RunOfShowItemSchema.model_validate(r) for r in json.loads(record.run_of_show_json)]
-    chat_history = [CoordinatorChatTurnSchema.model_validate(t) for t in json.loads(record.chat_history_json)]
+    categories = _CATEGORIES_ADAPTER.validate_json(record.categories_json)
+    vendors = _VENDORS_ADAPTER.validate_json(record.vendors_json)
+    milestones = _MILESTONES_ADAPTER.validate_json(record.milestones_json)
+    run_of_show = _ROS_ADAPTER.validate_json(record.run_of_show_json)
+    chat_history = _CHAT_ADAPTER.validate_json(record.chat_history_json)
     return profile, weather, categories, vendors, milestones, run_of_show, chat_history
 
 
 def _hydrate_plan_response(
     record: EventPlanRecord,
     session: Session,
+    preloaded_snapshots: Optional[List[PlanSnapshotRecord]] = None,
 ) -> EventPlanResponseSchema:
     profile, weather, categories, vendors, milestones, run_of_show, chat_history = _deserialize_plan_state(record)
 
@@ -73,11 +85,14 @@ def _hydrate_plan_response(
     )
     updated_milestones = recalculate_milestones_for_date(milestones, profile.event_date)
 
-    snap_records = session.exec(
-        select(PlanSnapshotRecord)
-        .where(PlanSnapshotRecord.plan_id == record.id)
-        .order_by(PlanSnapshotRecord.created_at.desc())
-    ).all()
+    if preloaded_snapshots is not None:
+        snap_records = preloaded_snapshots
+    else:
+        snap_records = session.exec(
+            select(PlanSnapshotRecord)
+            .where(PlanSnapshotRecord.plan_id == record.id)
+            .order_by(PlanSnapshotRecord.created_at.desc())
+        ).all()
 
     snapshots = [
         PlanSnapshotSchema(
@@ -117,7 +132,7 @@ def _create_snapshot(
     session: Session,
 ) -> PlanSnapshotRecord:
     profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
-    categories = [BudgetCategorySchema.model_validate(c) for c in json.loads(record.categories_json)]
+    categories = _CATEGORIES_ADAPTER.validate_json(record.categories_json)
     total_est = round(sum(c.estimated_amount for c in categories), 2)
 
     snap = PlanSnapshotRecord(
@@ -135,6 +150,17 @@ def _create_snapshot(
         run_of_show_json=record.run_of_show_json,
     )
     session.add(snap)
+
+    # Prune oldest snapshots beyond retention cap to prevent unbounded table growth
+    existing_snaps = session.exec(
+        select(PlanSnapshotRecord)
+        .where(PlanSnapshotRecord.plan_id == record.id)
+        .order_by(PlanSnapshotRecord.created_at.desc())
+    ).all()
+    if len(existing_snaps) >= MAX_SNAPSHOTS_PER_PLAN:
+        for stale_snap in existing_snaps[MAX_SNAPSHOTS_PER_PLAN - 1 :]:
+            session.delete(stale_snap)
+
     return snap
 
 
@@ -155,7 +181,25 @@ def get_system_status(
 @router.get("/plans", response_model=List[EventPlanResponseSchema])
 def list_plans(session: Session = Depends(get_session)):
     records = session.exec(select(EventPlanRecord).order_by(EventPlanRecord.updated_at.desc())).all()
-    return [_hydrate_plan_response(r, session) for r in records]
+    if not records:
+        return []
+
+    # Batch-load all snapshots in a single query to avoid N+1 database round-trips
+    plan_ids = [r.id for r in records]
+    all_snapshots = session.exec(
+        select(PlanSnapshotRecord)
+        .where(PlanSnapshotRecord.plan_id.in_(plan_ids))
+        .order_by(PlanSnapshotRecord.created_at.desc())
+    ).all()
+
+    snapshots_by_plan: Dict[str, List[PlanSnapshotRecord]] = defaultdict(list)
+    for snap in all_snapshots:
+        snapshots_by_plan[snap.plan_id].append(snap)
+
+    return [
+        _hydrate_plan_response(r, session, preloaded_snapshots=snapshots_by_plan[r.id])
+        for r in records
+    ]
 
 
 @router.post("/plans", response_model=EventPlanResponseSchema, status_code=status.HTTP_201_CREATED)
@@ -224,9 +268,9 @@ def evaluate_what_if(
         raise HTTPException(status_code=404, detail="EventPlan not found")
 
     base_profile = ConstraintProfileSchema.model_validate_json(record.constraint_profile_json)
-    categories = [BudgetCategorySchema.model_validate(c) for c in json.loads(record.categories_json)]
-    vendors = [VendorCandidateSchema.model_validate(v) for v in json.loads(record.vendors_json)]
-    milestones = [MilestoneTaskSchema.model_validate(m) for m in json.loads(record.milestones_json)]
+    categories = _CATEGORIES_ADAPTER.validate_json(record.categories_json)
+    vendors = _VENDORS_ADAPTER.validate_json(record.vendors_json)
+    milestones = _MILESTONES_ADAPTER.validate_json(record.milestones_json)
     weather = WeatherContextSchema.model_validate_json(record.weather_context_json)
 
     baseline_cats, _ = evaluate_plan_constraints(base_profile, categories, vendors, weather)

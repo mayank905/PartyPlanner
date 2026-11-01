@@ -14,14 +14,25 @@ export const CURRENCY_SYMBOL_MAP: Record<CurrencyCode, string> = {
   GBP: '£',
 };
 
-export function formatCurrency(amount: number, currency: CurrencyCode = 'INR'): string {
-  const locale = LOCALE_MAP[currency] || 'en-IN';
-  try {
-    return new Intl.NumberFormat(locale, {
+const FORMATTER_CACHE = new Map<CurrencyCode, Intl.NumberFormat>();
+
+function getCurrencyFormatter(currency: CurrencyCode): Intl.NumberFormat {
+  let formatter = FORMATTER_CACHE.get(currency);
+  if (!formatter) {
+    const locale = LOCALE_MAP[currency] || 'en-IN';
+    formatter = new Intl.NumberFormat(locale, {
       style: 'currency',
       currency,
       maximumFractionDigits: 0,
-    }).format(Math.round(amount));
+    });
+    FORMATTER_CACHE.set(currency, formatter);
+  }
+  return formatter;
+}
+
+export function formatCurrency(amount: number, currency: CurrencyCode = 'INR'): string {
+  try {
+    return getCurrencyFormatter(currency).format(Math.round(amount));
   } catch {
     return `${CURRENCY_SYMBOL_MAP[currency] || '₹'}${Math.round(amount).toLocaleString('en-IN')}`;
   }
